@@ -29,3 +29,5 @@ data/**/*.onnx
 
 # VSCode
 .vscode/
+
+!.env.example

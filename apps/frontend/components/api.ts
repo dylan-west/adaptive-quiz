@@ -54,3 +54,13 @@ export async function generateItemsForDocQuery(doc_id: string, query: string, pe
   })
   return data
 }
+
+export async function docsList(owner_email: string, limit = 20) {
+  const { data } = await api.get('/docs/list', { params: { owner_email, limit } })
+  return data
+}
+
+export async function quizRecap(doc_id: string, user_email: string) {
+  const { data } = await api.get('/quiz/recap', { params: { doc_id, user_email } })
+  return data
+}

@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS items (
   stem TEXT NOT NULL,
   choices TEXT[] NOT NULL,
   correct_index INT NOT NULL,
+  rationale TEXT,
   concept_id UUID REFERENCES concepts(id),
   a REAL DEFAULT 1.0,   -- IRT discrimination
   b REAL DEFAULT 0.0,   -- IRT difficulty

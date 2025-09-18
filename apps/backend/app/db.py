@@ -2,9 +2,9 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session, DeclarativeBase
 from typing import Generator
-from .config import settings
+from .config import get_database_url
 
-engine = create_engine(settings.database_url, pool_pre_ping=True)
+engine = create_engine(get_database_url(), pool_pre_ping=True)
 
 class Base(DeclarativeBase):
     pass

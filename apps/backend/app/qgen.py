@@ -1,5 +1,31 @@
 import os, json, re, textwrap
 from typing import List, Dict
+import re
+
+_CHOICE_PREFIX_RE = re.compile(r"^\s*[A-Da-d]\s*[\.):-]?\s*")
+
+def _strip_choice_prefix(s: str) -> str:
+    return _CHOICE_PREFIX_RE.sub("", s or "").strip()
+
+def _looks_placeholder(s: str) -> bool:
+    t = (s or "").strip()
+    return bool(re.fullmatch(r"[A-Da-d][\.)]?", t))
+
+def _sanitize_choices(choices: List[str]) -> List[str] | None:
+    # Remove leading labels like "A.", "B)", etc., and validate
+    if not isinstance(choices, list):
+        return None
+    cleaned = [_strip_choice_prefix(str(c)) for c in choices]
+    # reject if any too short or still placeholders
+    if any(len(c) < 3 or _looks_placeholder(c) for c in cleaned):
+        return None
+    # force exactly 4 if more provided; else reject if not 4
+    if len(cleaned) != 4:
+        return None
+    # Must be unique
+    if len(set(c.lower() for c in cleaned)) < 4:
+        return None
+    return cleaned
 
 def _fallback_mcqs(text: str, n: int = 1) -> List[Dict]:
     # Super-simple heuristic MCQ (useful when no API key).
@@ -24,14 +50,23 @@ def generate_mcqs(text: str, n: int = 1) -> List[Dict]:
         from openai import OpenAI
         client = OpenAI()
         prompt = textwrap.dedent(f"""
-        Create {n} multiple-choice question(s) from the passage.
-        Output strict JSON list with objects:
-        {{
-          "stem": "...",
-          "choices": ["A","B","C","D"],
-          "correct_index": 0,
-          "rationale": "..."
-        }}
+        Create {n} multiple-choice question(s) from the passage below.
+        Requirements for each item:
+        - Provide a clear "stem" that can be answered from the passage.
+        - Provide exactly 4 answer options in "choices" as plain strings of text, WITHOUT leading letters (no "A.", "B)", etc.).
+        - Do NOT use placeholders like "A", "B", "C", "D" as the options; options must be meaningful phrases.
+        - Use "correct_index" as the 0-based index of the correct option in the choices array.
+        - Include a short "rationale" explaining why the correct answer is correct.
+        Output a strict JSON array only. Example schema (not literal values):
+        [
+          {{
+            "stem": "...",
+            "choices": ["option text 1","option text 2","option text 3","option text 4"],
+            "correct_index": 0,
+            "rationale": "..."
+          }}
+        ]
+
         Passage:
         \"\"\"{text[:1200]}\"\"\"
         """).strip()
@@ -46,14 +81,23 @@ def generate_mcqs(text: str, n: int = 1) -> List[Dict]:
         m = re.search(r"\[.*\]", content, flags=re.S)
         raw = m.group(0) if m else content
         items = json.loads(raw)
-        # Basic validation
+        # Basic validation + sanitation
         out = []
         for it in items:
-            if not all(k in it for k in ("stem","choices","correct_index")): 
+            if not all(k in it for k in ("stem","choices","correct_index")):
                 continue
-            if not isinstance(it["choices"], list) or len(it["choices"]) < 3:
+            ch = _sanitize_choices(it.get("choices", []))
+            if not ch:
                 continue
-            it.setdefault("rationale","")
+            try:
+                ci = int(it.get("correct_index", 0))
+            except Exception:
+                continue
+            if not (0 <= ci < len(ch)):
+                continue
+            it.setdefault("rationale", "")
+            # Replace choices with cleaned versions
+            it["choices"] = ch
             out.append(it)
         return out or _fallback_mcqs(text, n)
     except Exception:

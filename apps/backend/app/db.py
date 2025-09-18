@@ -14,6 +14,11 @@ SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 def get_session() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
-        yield db
+        yield db           # handlers can use the session
+        db.commit()        # <-- commit on success
+    except:
+        db.rollback()      # <-- rollback on error
+        raise
     finally:
         db.close()
+

@@ -3,6 +3,7 @@
 from fastapi import APIRouter, Depends, Query, HTTPException, File, UploadFile, Form
 from pydantic import BaseModel
 from typing import Optional
+import math
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 import os
@@ -11,7 +12,7 @@ from uuid import UUID
 
 from .db import get_session
 from .embedder import embed_texts, DIM as EMB_DIM
-from .pdf_ingest import extract_pages_text, chunk_pages
+from .pdf_ingest import extract_pages_text, chunk_pages, ocr_pages_with_openai
 from .qgen import generate_mcqs
 
 router = APIRouter()
@@ -224,7 +225,7 @@ def ingest_pdf(
 ):
     """
     Extract text per page with PyMuPDF (digital PDFs), chunk, embed, store.
-    If no text layer found (likely a scan), return 422 to suggest OCR.
+    If no text layer found (likely a scan), optionally OCR via OpenAI Vision when enabled.
     """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(file.file.read())
@@ -238,10 +239,27 @@ def ingest_pdf(
         if max_pages and len(pages) > max_pages:
             pages = pages[:max_pages]
 
-        if all(not t for _, t in pages):
+        # OCR fallback for pages with no text
+        empties = [pg for (pg, txt) in pages if not (txt and txt.strip())]
+        use_ocr = os.getenv("OCR_PROVIDER", "").lower() == "openai" and bool(os.getenv("OPENAI_API_KEY"))
+        if empties and use_ocr:
+            try:
+                ocred = ocr_pages_with_openai(
+                    tmp_path,
+                    empties,
+                    dpi=int(os.getenv("OCR_DPI", "150")),
+                    model=os.getenv("OCR_MODEL", "gpt-4o-mini"),
+                )
+                ocr_map = {pg: t for pg, t in ocred}
+                pages = [(pg, (ocr_map.get(pg) or txt or "").strip()) for (pg, txt) in pages]
+            except Exception as e:
+                # Don't fail ingestion; surface helpful error
+                raise HTTPException(status_code=502, detail=f"OCR failed: {e}")
+
+        if all(not (t and t.strip()) for _, t in pages):
             raise HTTPException(
                 status_code=422,
-                detail="No text layer found (likely a scanned PDF). Add OCR first or enable an OCR pipeline.",
+                detail="No text found. If this is a scanned PDF, set OCR_PROVIDER=openai and provide OPENAI_API_KEY.",
             )
 
         # ensure user
@@ -351,18 +369,37 @@ class QuizAnswerReq(BaseModel):
 def quiz_next(doc_id: str, user_email: str, db: Session = Depends(get_session)):
     """
     Returns the next unanswered item for this user+doc, or 404 if none left.
+    Adaptive selection: choose item whose difficulty b is closest to user's theta.
     """
     user_id = _ensure_user(db, user_email)
+    # Ensure learner state exists; default theta=0.0
+    theta = db.execute(text("SELECT theta FROM learner_state WHERE user_id = :uid"), {"uid": user_id}).scalar()
+    if theta is None:
+        db.execute(text("""
+            INSERT INTO learner_state(user_id, theta, p_known)
+            VALUES (:uid, 0.0, '{}'::jsonb)
+            ON CONFLICT (user_id) DO NOTHING
+        """), {"uid": user_id})
+        theta = 0.0
+
+    # Pick item with minimal exposure for its concept, then closest difficulty to theta
     row = db.execute(text("""
+        WITH exp AS (
+            SELECT i2.concept_id, count(*)::int AS cnt
+            FROM interactions r2
+            JOIN items i2 ON i2.id = r2.item_id
+            WHERE r2.user_id = :uid
+            GROUP BY i2.concept_id
+        )
         SELECT i.id::text AS item_id, i.stem, i.choices, i.correct_index
         FROM items i
         JOIN chunks c ON c.id = i.source_chunk_id
-        LEFT JOIN interactions r
-          ON r.item_id = i.id AND r.user_id = :uid
+        LEFT JOIN interactions r ON r.item_id = i.id AND r.user_id = :uid
+        LEFT JOIN exp ON exp.concept_id = i.concept_id
         WHERE c.doc_id = :doc AND r.id IS NULL
-        ORDER BY random()
+        ORDER BY COALESCE(exp.cnt, 0) ASC, abs(i.b - :theta) ASC, i.a DESC, random()
         LIMIT 1
-    """), {"uid": user_id, "doc": doc_id}).mappings().first()
+    """), {"uid": user_id, "doc": doc_id, "theta": float(theta)}).mappings().first()
 
     if not row:
         raise HTTPException(status_code=404, detail="No remaining items for this document")
@@ -373,29 +410,123 @@ def quiz_next(doc_id: str, user_email: str, db: Session = Depends(get_session)):
 def quiz_answer(payload: QuizAnswerReq, db: Session = Depends(get_session)):
     """
     Records the answer; returns correctness.
+    Adaptive update: update learner_state.theta via 2PL IRT gradient step.
     Uses interactions.correct (boolean) and interactions.chosen (int).
     """
     user_id = _ensure_user(db, payload.user_email)
 
     # Fetch item & correct answer
     item = db.execute(text("""
-        SELECT id, correct_index FROM items WHERE id = :iid
+        SELECT id, correct_index, a, b FROM items WHERE id = :iid
     """), {"iid": str(payload.item_id)}).first()
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
+    # If already answered, do not double-update; return prior correctness
+    prior = db.execute(text("""
+        SELECT correct FROM interactions WHERE user_id = :uid AND item_id = :iid LIMIT 1
+    """), {"uid": user_id, "iid": item.id}).scalar()
+    if prior is not None:
+        return {"correct": bool(prior)}
+
+    # Current theta
+    theta = db.execute(text("SELECT theta FROM learner_state WHERE user_id = :uid"), {"uid": user_id}).scalar()
+    if theta is None:
+        theta = 0.0
+
     is_correct = (payload.choice_index == item.correct_index)
 
-    # Write interaction (schema column name is 'chosen'). Use an idempotent insert.
-    db.execute(text("""
-        INSERT INTO interactions(user_id, item_id, chosen, correct)
-        SELECT :uid, :iid, :ci, :ok
-        WHERE NOT EXISTS (
-            SELECT 1 FROM interactions WHERE user_id = :uid AND item_id = :iid
-        )
-    """), {"uid": user_id, "iid": item.id, "ci": payload.choice_index, "ok": is_correct})
+    # 2PL model: P(correct) = sigmoid(a*(theta - b))
+    a = float(getattr(item, 'a', 1.0) or 1.0)
+    b = float(getattr(item, 'b', 0.0) or 0.0)
+    p = 1.0 / (1.0 + math.exp(-a * (float(theta) - b)))
+    y = 1.0 if is_correct else 0.0
+    lr = float(os.getenv("ADAPT_LR", "0.2"))
+    # Stabilize updates w.r.t discrimination: use gradient scaled independent of 'a'
+    theta_new = float(theta) + lr * (y - p)
+    # Clamp to typical IRT range
+    theta_new = max(-3.0, min(3.0, theta_new))
 
-    return {"correct": bool(is_correct)}
+    # Write interaction (schema column name is 'chosen'), with theta before/after.
+    db.execute(text("""
+        INSERT INTO interactions(user_id, item_id, chosen, correct, theta_before, theta_after)
+        VALUES (:uid, :iid, :ci, :ok, :tb, :ta)
+    """), {"uid": user_id, "iid": item.id, "ci": payload.choice_index, "ok": is_correct,
+            "tb": float(theta), "ta": float(theta_new)})
+
+    # Upsert learner state
+    db.execute(text("""
+        INSERT INTO learner_state(user_id, theta, p_known, updated_at)
+        VALUES (:uid, :theta, '{}'::jsonb, now())
+        ON CONFLICT (user_id) DO UPDATE SET theta = EXCLUDED.theta, updated_at = now()
+    """), {"uid": user_id, "theta": float(theta_new)})
+
+    resp = {"correct": bool(is_correct)}
+    if os.getenv("ADAPT_DEBUG", "").lower() in ("1","true","yes"):
+        resp.update({"p": round(float(p), 4), "theta_before": float(theta), "theta_after": float(theta_new)})
+    return resp
+
+@router.get("/learner/state")
+def learner_state(user_email: str, doc_id: Optional[str] = None, db: Session = Depends(get_session)):
+    """
+    Returns the learner's current theta and a naive 95% CI estimate based on Fisher information
+    accumulated over answered items. If doc_id is provided, also includes doc-specific accuracy.
+    """
+    user_id = _ensure_user(db, user_email)
+    theta = db.execute(text("SELECT theta FROM learner_state WHERE user_id = :uid"), {"uid": user_id}).scalar()
+    if theta is None:
+        theta = 0.0
+
+    # Total Fisher information from answered items: sum a^2 * p*(1-p)
+    rows = db.execute(text("""
+        SELECT i.a, i.b
+        FROM interactions r
+        JOIN items i ON i.id = r.item_id
+        WHERE r.user_id = :uid
+    """), {"uid": user_id}).fetchall()
+    info = 0.0
+    t = float(theta)
+    for a, b in rows:
+        a = float(a or 1.0)
+        b = float(b or 0.0)
+        p = 1.0 / (1.0 + math.exp(-a * (t - b)))
+        info += a * a * p * (1.0 - p)
+    ci = None
+    if info > 1e-6:
+        # Wald interval: theta ± 1.96 / sqrt(info)
+        w = 1.96 / math.sqrt(info)
+        ci = [round(t - w, 3), round(t + w, 3)]
+
+    payload = {"theta": round(t, 3), "theta_ci95": ci}
+
+    if doc_id:
+        total = db.execute(text("""
+            SELECT count(*) FROM items i
+            JOIN chunks c ON c.id = i.source_chunk_id
+            WHERE c.doc_id = :doc
+        """), {"doc": doc_id}).scalar_one()
+        answered = db.execute(text("""
+            SELECT count(*) FROM interactions r
+            JOIN items i ON i.id = r.item_id
+            JOIN chunks c ON c.id = i.source_chunk_id
+            WHERE r.user_id = :uid AND c.doc_id = :doc
+        """), {"uid": user_id, "doc": doc_id}).scalar_one()
+        correct = db.execute(text("""
+            SELECT count(*) FROM interactions r
+            JOIN items i ON i.id = r.item_id
+            JOIN chunks c ON c.id = i.source_chunk_id
+            WHERE r.user_id = :uid AND c.doc_id = :doc AND r.correct = true
+        """), {"uid": user_id, "doc": doc_id}).scalar_one()
+        acc = (correct / answered) if answered else 0.0
+        payload.update({
+            "doc_id": doc_id,
+            "total": total,
+            "answered": answered,
+            "correct": correct,
+            "accuracy": round(acc, 3),
+        })
+
+    return payload
 
 @router.get("/quiz/progress")
 def quiz_progress(doc_id: str, user_email: str, db: Session = Depends(get_session)):

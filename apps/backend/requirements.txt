@@ -10,3 +10,5 @@ openai>=1.40
 
 pymupdf
 python-multipart
+pytest
+httpx

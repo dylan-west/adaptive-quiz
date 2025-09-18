@@ -1,5 +1,7 @@
 import fitz  # PyMuPDF
 from typing import List, Tuple
+import os
+import base64
 
 def extract_pages_text(pdf_path: str) -> List[Tuple[int, str]]:
     """
@@ -60,4 +62,56 @@ def chunk_pages(
         pieces = chunk_text_by_chars(txt, max_chars=max_chars, overlap=overlap)
         for piece in pieces:
             out.append((piece, pg, pg))
+    return out
+
+# ------------- OCR (OpenAI Vision) -------------
+
+def ocr_pages_with_openai(
+    pdf_path: str,
+    page_numbers: List[int],
+    dpi: int = 150,
+    model: str | None = None,
+) -> List[Tuple[int, str]]:
+    """
+    OCR specific pages from a PDF using OpenAI Vision. Returns (page_number, text).
+    Requires OPENAI_API_KEY in environment.
+    """
+    if not page_numbers:
+        return []
+
+    try:
+        from openai import OpenAI
+    except Exception as e:
+        raise RuntimeError("openai package not installed or import failed") from e
+
+    model = model or os.getenv("OCR_MODEL", "gpt-4o-mini")
+    client = OpenAI()  # reads OPENAI_API_KEY
+
+    out: List[Tuple[int, str]] = []
+    doc = fitz.open(pdf_path)
+    try:
+        for pg_no in page_numbers:
+            if pg_no < 1 or pg_no > len(doc):
+                continue
+            page = doc[pg_no - 1]
+            zoom = float(dpi) / 72.0
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            png_bytes = pix.tobytes("png")
+            b64 = base64.b64encode(png_bytes).decode("utf-8")
+
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Extract all readable text from this page. Return plain UTF-8 text only."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+                    ]
+                }],
+                temperature=0.0,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            out.append((pg_no, text))
+    finally:
+        doc.close()
     return out

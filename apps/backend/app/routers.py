@@ -346,6 +346,67 @@ def items_generate_from_doc(payload: GenItemsReq, db: Session = Depends(get_sess
 
     return {"doc_id": payload.doc_id, "chunks_processed": len(rows), "items_created": created}
 
+class GenItemsForDocQueryReq(BaseModel):
+    doc_id: str
+    query: str
+    per_chunk: int = 1
+    max_chunks: int = 10
+
+@router.post("/items/generate_for_doc_query")
+def items_generate_for_doc_query(payload: GenItemsForDocQueryReq, db: Session = Depends(get_session)):
+    """
+    Generate MCQ items for a specific document, focusing on chunks most similar to the query.
+    Uses vector search within the doc; falls back to text match if embedding fails.
+    """
+    # Select candidate chunks within the doc by vector similarity
+    try:
+        vec = embed_texts([payload.query])[0]
+        qvec = "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
+        rows = db.execute(text(
+            """
+            SELECT c.id, c.text
+            FROM chunks c
+            JOIN embeddings e ON e.chunk_id = c.id
+            WHERE c.doc_id = :doc
+            ORDER BY e.embedding <=> (:qvec)::vector
+            LIMIT :lim
+            """
+        ), {"doc": payload.doc_id, "qvec": qvec, "lim": payload.max_chunks}).fetchall()
+        mode = "vector"
+    except Exception:
+        rows = db.execute(text(
+            """
+            SELECT c.id, c.text
+            FROM chunks c
+            WHERE c.doc_id = :doc AND c.text ILIKE '%' || :q || '%'
+            ORDER BY c.created_at DESC
+            LIMIT :lim
+            """
+        ), {"doc": payload.doc_id, "q": payload.query, "lim": payload.max_chunks}).fetchall()
+        mode = "text"
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="No relevant chunks found for query in this document.")
+
+    created = 0
+    for cid, chunk_text in rows:
+        for it in generate_mcqs(chunk_text, n=payload.per_chunk):
+            db.execute(text(
+                """
+                INSERT INTO items(stem, choices, correct_index, concept_id, a, b, source_chunk_id)
+                VALUES (:stem, :choices, :ci, NULL, 1.0, 0.0, :src)
+                """
+            ), {"stem": it["stem"], "choices": it["choices"], "ci": it["correct_index"], "src": cid})
+            created += 1
+
+    return {
+        "doc_id": payload.doc_id,
+        "query": payload.query,
+        "mode": mode,
+        "chunks_processed": len(rows),
+        "items_created": created,
+    }
+
 @router.get("/items/by_doc")
 def items_by_doc(doc_id: str, limit: int = 10, db: Session = Depends(get_session)):
     rows = db.execute(text("""
